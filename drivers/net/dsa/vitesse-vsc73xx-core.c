@@ -39,6 +39,7 @@
 #define VSC73XX_BLOCK_SYSTEM	0x7 /* Only subblock 0 */
 
 #define CPU_PORT	6 /* CPU port */
+#define VLAN_TABLE_ATTEMPTS 10
 
 /* MAC Block registers */
 #define VSC73XX_MAC_CFG		0x00
@@ -62,6 +63,8 @@
 #define VSC73XX_CAT_DROP	0x6e
 #define VSC73XX_CAT_PR_MISC_L2	0x6f
 #define VSC73XX_CAT_PR_USR_PRIO	0x75
+#define VSC73XX_CAT_VLAN_MISC 0x79
+#define VSC73XX_CAT_PORT_VLAN 0x7a
 #define VSC73XX_Q_MISC_CONF	0xdf
 
 /* MAC_CFG register bits */
@@ -122,6 +125,17 @@
 #define VSC73XX_ADVPORTM_IO_LOOPBACK	BIT(1)
 #define VSC73XX_ADVPORTM_HOST_LOOPBACK	BIT(0)
 
+/*  TXUPDCFG transmit modify setup bits */
+#define VSC73XX_TXUPDCFG_DSCP_REWR_MODE	GENMASK(20, 19)
+#define VSC73XX_TXUPDCFG_DSCP_REWR_ENA	BIT(18)
+#define VSC73XX_TXUPDCFG_TX_INT_TO_USRPRIO_ENA	BIT(17)
+#define VSC73XX_TXUPDCFG_TX_UNTAGGED_VID	GENMASK(15, 4)
+#define VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA	BIT(3)
+#define VSC73XX_TXUPDCFG_TX_UPDATE_CRC_CPU_ENA	BIT(1)
+#define VSC73XX_TXUPDCFG_TX_INSERT_TAG	BIT(0)
+
+#define VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_SHIFT 4
+
 /* CAT_DROP categorizer frame dropping register bits */
 #define VSC73XX_CAT_DROP_DROP_MC_SMAC_ENA	BIT(6)
 #define VSC73XX_CAT_DROP_FWD_CTRL_ENA		BIT(4)
@@ -134,6 +148,15 @@
 #define VSC73XX_Q_MISC_CONF_EARLY_TX_MASK	GENMASK(4, 1)
 #define VSC73XX_Q_MISC_CONF_EARLY_TX_512	(1 << 1)
 #define VSC73XX_Q_MISC_CONF_MAC_PAUSE_MODE	BIT(0)
+
+/* CAT_VLAN_MISC categorizer VLAN miscellaneous bits*/
+#define VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA BIT(8)
+#define VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA BIT(7)
+
+/* CAT_PORT_VLAN categorizer port VLAN*/
+#define VSC73XX_CAT_PORT_VLAN_VLAN_CFI BIT(15)
+#define VSC73XX_CAT_PORT_VLAN_VLAN_USR_PRIO GENMASK(14, 12)
+#define VSC73XX_CAT_PORT_VLAN_VLAN_VID GENMASK(11, 0)
 
 /* Frame analyzer block 2 registers */
 #define VSC73XX_STORMLIMIT	0x02
@@ -185,7 +208,8 @@
 #define VSC73XX_VLANACCESS_VLAN_MIRROR		BIT(29)
 #define VSC73XX_VLANACCESS_VLAN_SRC_CHECK	BIT(28)
 #define VSC73XX_VLANACCESS_VLAN_PORT_MASK	GENMASK(9, 2)
-#define VSC73XX_VLANACCESS_VLAN_TBL_CMD_MASK	GENMASK(2, 0)
+#define VSC73XX_VLANACCESS_VLAN_PORT_MASK_SHIFT	2
+#define VSC73XX_VLANACCESS_VLAN_TBL_CMD_MASK	GENMASK(1, 0)
 #define VSC73XX_VLANACCESS_VLAN_TBL_CMD_IDLE	0
 #define VSC73XX_VLANACCESS_VLAN_TBL_CMD_READ_ENTRY	1
 #define VSC73XX_VLANACCESS_VLAN_TBL_CMD_WRITE_ENTRY	2
@@ -1029,6 +1053,278 @@ static void vsc73xx_get_ethtool_stats(struct dsa_switch *ds, int port,
 	}
 }
 
+static int
+vsc73xx_port_wait_for_vlan_table_cmd(struct vsc73xx *vsc, int attempts)
+{
+	u32 val;
+	int i;
+
+	for (i = 0; i <= attempts; i++) {
+		vsc73xx_read(vsc, VSC73XX_BLOCK_ANALYZER, 0, VSC73XX_VLANACCESS,
+			     &val);
+		if ((val & VSC73XX_VLANACCESS_VLAN_TBL_CMD_MASK) ==
+		    VSC73XX_VLANACCESS_VLAN_TBL_CMD_IDLE)
+			return 0;
+	}
+	return -EBUSY;
+}
+
+static int
+vsc73xx_port_read_vlan_table_entry(struct dsa_switch *ds, u16 vid, u8 *portmap)
+{
+	struct vsc73xx *vsc = ds->priv;
+	u32 val;
+	int ret;
+
+	if (vid > 4095)
+		return -EPERM;
+	vsc73xx_write(vsc, VSC73XX_BLOCK_ANALYZER, 0, VSC73XX_VLANTIDX, vid);
+	ret = vsc73xx_port_wait_for_vlan_table_cmd(vsc, VLAN_TABLE_ATTEMPTS);
+	if (ret)
+		return ret;
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_ANALYZER, 0, VSC73XX_VLANACCESS,
+			    VSC73XX_VLANACCESS_VLAN_TBL_CMD_MASK,
+			    VSC73XX_VLANACCESS_VLAN_TBL_CMD_READ_ENTRY);
+	ret = vsc73xx_port_wait_for_vlan_table_cmd(vsc, VLAN_TABLE_ATTEMPTS);
+	if (ret)
+		return ret;
+	vsc73xx_read(vsc, VSC73XX_BLOCK_ANALYZER, 0, VSC73XX_VLANACCESS, &val);
+	*portmap =
+	    (val & VSC73XX_VLANACCESS_VLAN_PORT_MASK) >>
+	    VSC73XX_VLANACCESS_VLAN_PORT_MASK_SHIFT;
+	return 0;
+}
+
+static int
+vsc73xx_port_write_vlan_table_entry(struct dsa_switch *ds, u16 vid, u8 portmap)
+{
+	struct vsc73xx *vsc = ds->priv;
+	int ret;
+
+	if (vid > 4095)
+		return -EPERM;
+	vsc73xx_write(vsc, VSC73XX_BLOCK_ANALYZER, 0, VSC73XX_VLANTIDX, vid);
+	ret = vsc73xx_port_wait_for_vlan_table_cmd(vsc, VLAN_TABLE_ATTEMPTS);
+	if (ret)
+		return ret;
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_ANALYZER, 0, VSC73XX_VLANACCESS,
+			    VSC73XX_VLANACCESS_VLAN_TBL_CMD_MASK |
+			    VSC73XX_VLANACCESS_VLAN_PORT_MASK,
+			    VSC73XX_VLANACCESS_VLAN_TBL_CMD_WRITE_ENTRY |
+			    (portmap <<
+			     VSC73XX_VLANACCESS_VLAN_PORT_MASK_SHIFT));
+	ret = vsc73xx_port_wait_for_vlan_table_cmd(vsc, VLAN_TABLE_ATTEMPTS);
+	if (ret)
+		return ret;
+	return 0;
+}
+
+static int
+vsc73xx_port_update_vlan_table(struct dsa_switch *ds, int port, u16 vid_begin,
+			       u16 vid_end, bool set)
+{
+	u8 portmap;
+	int ret;
+	u16 i;
+
+	if (vid_begin > 4095 || vid_end > 4095 || vid_begin > vid_end)
+		return -EPERM;
+
+	for (i = vid_begin; i <= vid_end; i++) {
+		ret = vsc73xx_port_read_vlan_table_entry(ds, i, &portmap);
+		if (ret)
+			return ret;
+		if (set)
+			portmap |= BIT(port);
+		else
+			portmap &= ~BIT(port);
+
+		ret = vsc73xx_port_write_vlan_table_entry(ds, i, portmap);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int vsc73xx_port_set_vlan_unaware(struct dsa_switch *ds, int port)
+{
+	struct vsc73xx *vsc = ds->priv;
+	int ret;
+
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_MAC_CFG,
+			    VSC73XX_MAC_CFG_VLAN_AWR,
+			    ~VSC73XX_MAC_CFG_VLAN_AWR);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_MAC_CFG,
+			    VSC73XX_MAC_CFG_VLAN_DBLAWR,
+			    ~VSC73XX_MAC_CFG_VLAN_DBLAWR);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_VLAN_MISC,
+			    VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA,
+			    VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_VLAN_MISC,
+			    VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA,
+			    VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_DROP,
+			    VSC73XX_CAT_DROP_TAGGED_ENA,
+			    ~VSC73XX_CAT_DROP_TAGGED_ENA);
+
+	ret = vsc73xx_port_update_vlan_table(ds, port, 0, 4095, 0);
+	return ret;
+
+}
+
+static int vsc73xx_port_set_vlan_aware(struct dsa_switch *ds, int port)
+{
+	struct vsc73xx *vsc = ds->priv;
+	int ret;
+
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_MAC_CFG,
+			    VSC73XX_MAC_CFG_VLAN_AWR, VSC73XX_MAC_CFG_VLAN_AWR);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_MAC_CFG,
+			    VSC73XX_MAC_CFG_VLAN_DBLAWR,
+			    ~VSC73XX_MAC_CFG_VLAN_DBLAWR);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_VLAN_MISC,
+			    VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA,
+			    ~VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_VLAN_MISC,
+			    VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA,
+			    ~VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_DROP,
+			    VSC73XX_CAT_DROP_TAGGED_ENA,
+			    ~VSC73XX_CAT_DROP_TAGGED_ENA);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_CAT_DROP,
+			    VSC73XX_CAT_DROP_UNTAGGED_ENA,
+			    VSC73XX_CAT_DROP_UNTAGGED_ENA);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_TXUPDCFG,
+			    VSC73XX_TXUPDCFG_TX_INSERT_TAG,
+			    VSC73XX_TXUPDCFG_TX_INSERT_TAG);
+	vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port, VSC73XX_TXUPDCFG,
+			    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA,
+			    ~VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA);
+
+	ret = vsc73xx_port_update_vlan_table(ds, port, 0, 4095, 0);
+	return ret;
+}
+
+static int
+vsc73xx_port_vlan_filtering(struct dsa_switch *ds, int port,
+			    bool vlan_filtering)
+{
+	int ret;
+	if (vlan_filtering) {
+		ret = vsc73xx_port_set_vlan_aware(ds, port);
+		if (ret)
+			return ret;
+		ret = vsc73xx_port_set_vlan_aware(ds, CPU_PORT);
+	} else
+		ret = vsc73xx_port_set_vlan_unaware(ds, port);
+	return ret;
+}
+
+static int vsc73xx_port_vlan_prepare(struct dsa_switch *ds, int port,
+				     const struct switchdev_obj_port_vlan *vlan)
+{
+	/* nothing needed */
+	return 0;
+}
+
+static void vsc73xx_port_vlan_add(struct dsa_switch *ds, int port,
+				  const struct switchdev_obj_port_vlan *vlan)
+{
+	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
+	struct vsc73xx *vsc = ds->priv;
+	int ret;
+
+	if (!dsa_port_is_vlan_filtering(&ds->ports[port]))
+		return;
+
+	ret =
+	    vsc73xx_port_update_vlan_table(ds, port, vlan->vid_begin,
+					   vlan->vid_end, 1);
+	if (ret)
+		return;
+
+	if (untagged && (port != CPU_PORT)) {
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_CAT_DROP,
+				    VSC73XX_CAT_DROP_UNTAGGED_ENA,
+				    ~VSC73XX_CAT_DROP_UNTAGGED_ENA);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_TXUPDCFG,
+				    VSC73XX_TXUPDCFG_TX_INSERT_TAG,
+				    VSC73XX_TXUPDCFG_TX_INSERT_TAG);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_TXUPDCFG,
+				    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA,
+				    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_TXUPDCFG,
+				    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID,
+				    (vlan->
+				     vid_end <<
+				     VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_SHIFT) &
+				    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID);
+	}
+	if (pvid && (port != CPU_PORT)) {
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_CAT_VLAN_MISC,
+				    VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA,
+				    ~VSC73XX_CAT_VLAN_MISC_VLAN_TCI_IGNORE_ENA);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_CAT_VLAN_MISC,
+				    VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA,
+				    VSC73XX_CAT_VLAN_MISC_VLAN_KEEP_TAG_ENA);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_CAT_PORT_VLAN,
+				    VSC73XX_CAT_PORT_VLAN_VLAN_VID,
+				    vlan->
+				    vid_end & VSC73XX_CAT_PORT_VLAN_VLAN_VID);
+	}
+
+}
+
+static int vsc73xx_port_vlan_del(struct dsa_switch *ds, int port,
+				 const struct switchdev_obj_port_vlan *vlan)
+{
+	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+	bool pvid = vlan->flags & BRIDGE_VLAN_INFO_PVID;
+	struct vsc73xx *vsc = ds->priv;
+	int ret;
+
+	if (!dsa_port_is_vlan_filtering(&ds->ports[port]))
+		return;
+
+	ret =
+	    vsc73xx_port_update_vlan_table(ds, port, vlan->vid_begin,
+					   vlan->vid_end, 0);
+	if (ret)
+		return ret;
+
+	if (untagged) {
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_CAT_DROP,
+				    VSC73XX_CAT_DROP_UNTAGGED_ENA,
+				    VSC73XX_CAT_DROP_UNTAGGED_ENA);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_TXUPDCFG,
+				    VSC73XX_TXUPDCFG_TX_INSERT_TAG,
+				    ~VSC73XX_TXUPDCFG_TX_INSERT_TAG);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_TXUPDCFG,
+				    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA,
+				    ~VSC73XX_TXUPDCFG_TX_UNTAGGED_VID_ENA);
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_TXUPDCFG,
+				    VSC73XX_TXUPDCFG_TX_UNTAGGED_VID, 0);
+	}
+	if (pvid) {
+		vsc73xx_update_bits(vsc, VSC73XX_BLOCK_MAC, port,
+				    VSC73XX_CAT_PORT_VLAN,
+				    VSC73XX_CAT_PORT_VLAN_VLAN_VID, 0);
+	}
+	return 0;
+}
+
 static const struct dsa_switch_ops vsc73xx_ds_ops = {
 	.get_tag_protocol = vsc73xx_get_tag_protocol,
 	.setup = vsc73xx_setup,
@@ -1040,6 +1336,10 @@ static const struct dsa_switch_ops vsc73xx_ds_ops = {
 	.get_sset_count = vsc73xx_get_sset_count,
 	.port_enable = vsc73xx_port_enable,
 	.port_disable = vsc73xx_port_disable,
+	.port_vlan_filtering = vsc73xx_port_vlan_filtering,
+	.port_vlan_prepare = vsc73xx_port_vlan_prepare,
+	.port_vlan_add = vsc73xx_port_vlan_add,
+	.port_vlan_del = vsc73xx_port_vlan_del,
 };
 
 static int vsc73xx_gpio_get(struct gpio_chip *chip, unsigned int offset)
