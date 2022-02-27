@@ -6,6 +6,7 @@
  */
 
 /include/ "p2020si-pre.dtsi"
+#include <dt-bindings/gpio/gpio.h>
 
 / {
 	model = "fsl,P2020RDB";
@@ -131,14 +132,52 @@
 		L2switch@2,0 {
 			#address-cells = <1>;
 			#size-cells = <1>;
-			compatible = "vitesse-7385";
+			compatible = "vitesse,vsc7385";
 			reg = <0x2 0x0 0x20000>;
+			reset-gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@1 {
+					reg = <1>;
+					label = "lan1";
+				};
+				port@2 {
+					reg = <2>;
+					label = "lan2";
+				};
+				port@3 {
+					reg = <3>;
+					label = "lan3";
+				};
+				port@4 {
+					reg = <4>;
+					label = "lan4";
+				};
+				vsc: port@6 {
+					reg = <6>;
+					label = "cpu";
+					ethernet = <&enet0>;
+					phy-mode = "rgmii";
+					fixed-link {
+						speed = <1000>;
+						full-duplex;
+						pause;
+					};
+				};
+			};
+
 		};
 
 	};
 
 	soc: soc@ffe00000 {
 		ranges = <0x0 0x0 0xffe00000 0x100000>;
+
+		gpio0: gpio-controller@fc00 {
+		};
 
 		i2c@3000 {
 			rtc@68 {
@@ -233,7 +272,7 @@
 
 		enet0: ethernet@24000 {
 			fixed-link = <1 1 1000 0 0>;
-			phy-connection-type = "rgmii-id";
+			phy-connection-type = "rgmii-txid";
 		};
 
 		enet1: ethernet@25000 {
