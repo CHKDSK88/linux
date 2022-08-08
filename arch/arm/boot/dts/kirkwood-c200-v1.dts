@@ -156,6 +156,31 @@
 			trigger-sources = <&hub_port1>;
 		};
 	};
+
+	thermal-zones {
+		/* Thermal zone works only with first disk */
+
+		disk0-thermal {
+			polling-delay = <20000>;
+			polling-delay-passive = <2000>;
+
+			thermal-sensors = <&hdd0_temp>;
+
+			/* Tripping points from the fan.script in the rootfs */
+			trips {
+				disk0_alert: disk0-alert {
+					temperature = <40000>;
+					hysteresis = <5000>;
+					type = "active";
+				};
+				disk0_crit: disk0-crit {
+					temperature = <60000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+	};
 };
 
 &eth0 {
@@ -280,6 +305,18 @@
 &sata {
 	status = "okay";
 	nr-ports = <2>;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	hdd0_temp: sata-port@0 {
+		reg = <0>;
+		#thermal-sensor-cells = <0>;
+	};
+
+	hdd1_temp: sata-port@1 {
+		reg = <1>;
+		#thermal-sensor-cells = <0>;
+	};
 };
 
 &uart0 {
